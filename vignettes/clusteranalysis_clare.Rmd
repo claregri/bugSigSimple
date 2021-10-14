@@ -1,0 +1,333 @@
+---
+title: "codeprez"
+output: html_notebook
+---
+
+# Packages installation
+
+```{r eval=FALSE, paged.print=TRUE}
+install.packages(c("devtools", "tidyverse", "kableExtra", "gt", "glue"))
+devtools::install_github("waldronlab/bugSigSimple")
+devtools::install_github("waldronlab/BugSigDBStats")
+devtools::install_github("waldronlab/bugsigdbr")
+```
+
+# Data import, recoding, and subset
+```{r results = FALSE}
+library(bugSigSimple)
+library(BugSigDBStats)
+dat <- bugsigdbr::importBugSigDB(cache = FALSE) 
+dim(dat)
+names(dat)
+```
+
+```{r results = FALSE}
+library(tidyverse)
+condsnew <- c("COVID-19")
+covid_all <- subsetByCondition(dat, condsnew) %>%
+  mutate(studyexp = paste(Study, Experiment, sep = "_")) %>%
+  mutate(
+    site = recode(`Body site`,
+      "feces" = "Gut",
+      "rectal" = "Gut",
+      "nasopharynx" = "aURT",
+      "oropharynx" = "aURT",
+      "nasopharynx,oropharynx" = "aURT",
+      "tongue" = "aURT"
+    )
+  ) %>%
+  mutate(comparison1 = paste(`Group 0 name`, `Group 1 name`, sep = " vs ")) %>%
+select(-c(Curator, `Curated date`, `Revision editor`, `LDA Score above`, `Matched on`, `Significance threshold`, `Confounders controlled for`))
+View(covid_all)
+
+library(stringr)
+regexp <- "[[:digit:]]+"
+studyno <- str_extract(covid_all$Study, regexp)
+expno <- str_extract(covid_all$Experiment, regexp)
+signo <- str_extract(covid_all$`Signature page name`, regexp)
+cbind(covid_all, studyno, expno, signo)
+
+covid_all2 <- covid_all %>%
+  mutate(ID = gsub(" ", "", paste("bsdb:", `studyno`, "/", `expno`, "/", `signo`))) %>%
+  mutate()
+  
+View(covid_all2)
+```
+
+##subset data by bodysite
+```{r}
+gut_sigs <- filter(covid_all2, 
+                           site == "Gut") %>%
+    drop_na(Source)
+URT_sigs <- filter(covid_all2, 
+                           site == "aURT") %>%
+  drop_na(Source)
+naso_sigs <- filter(covid_all2, 
+                           `Body site` == c("nasopharynx", "nasopharynx,oropharynx"))
+oro_sigs <- filter(covid_all2, 
+                           `Body site` == c("oropharynx", "nasopharynx,oropharynx"))
+```
+
+
+## Binomial Testing
+
+In this table, the Binomial Test p-value corresponds to the null hypothesis
+
+H0: the proportion of signatures in which the taxon is reported increased or decreased, relative to the total number of signatures in which it is reported, is equal to 0.5
+
+##binomial testing for all gut signatures
+```{r results = TRUE}
+library(kableExtra)
+kableExtra::kbl(bugSigSimple::createTaxonTable(gut_sigs))
+```
+
+## binomial testing for case-control gut signatures
+
+Filter for case-control comparisons [healthy controls vs COVID patients at any stage of infection]
+```{r results = FALSE}
+library(dplyr)
+healthy <- grepl(".*(healthy.*COVID|COVID.*healthy).*", gut_sigs$comparison1, ignore.case = TRUE)
+cc_gut_sigs1 <- gut_sigs %>%
+      filter(healthy == TRUE) 
+
+recovered <- grepl("Recovered", gut_sigs$`Group 1 name`, ignore.case = TRUE)
+rec_gut_sigs <- gut_sigs %>%
+  filter(recovered == TRUE)
+View(rec_gut_sigs)
+```
+
+```{r results = TRUE}
+library(bugSigSimple)
+cc_gut_sigs1_taxontable <- bugSigSimple::createTaxonTable(cc_gut_sigs1) %>% 
+  mutate(FDR =  p.adjust(p = `Binomial Test pval`, method="fdr")) %>%
+  relocate(FDR, .after = `Binomial Test pval`)
+kableExtra::kbl(cc_gut_sigs1_taxontable)
+```
+
+##add categorical variables for studies of interest (case/control, recovered pts, 2 sick groups) in each subset dataframe
+```{r results = FALSE}
+library(dplyr)
+healthynaso <- grepl(".*(control.*COVID|COVID.*control).*", naso_sigs$comparison1, ignore.case = TRUE)
+recovnaso <- grepl("recovered*", naso_sigs$comparison1, ignore.case = TRUE)
+sicknaso <- grepl(".*(patients.*patients|patients.*patients).*", naso_sigs$comparison1, ignore.case = TRUE)
+naso_sigs1 <- naso_sigs %>%
+      mutate(casecont = ifelse(healthynaso, 1, 0)) %>%
+   mutate(recov = ifelse(recovnaso, 1, 0)) %>%
+mutate(sick2 = ifelse(sicknaso, 1, 0))
+
+healthyoro <- grepl(".*(healthy.*COVID|COVID.*healthy).*", oro_sigs$comparison1, ignore.case = TRUE)
+recovoro <- grepl("recovered*", oro_sigs$comparison1, ignore.case = TRUE)
+sickoro <- grepl(".*(patients.*patients|patients.*patients).*", oro_sigs$comparison1, ignore.case = TRUE)
+oro_sigs1 <- oro_sigs %>%
+     mutate(casecont = ifelse(healthyoro, 1, 0)) %>%
+   mutate(recov = ifelse(recovoro, 1, 0)) %>%
+mutate(sick2 = ifelse(sickoro, 1, 0))
+
+healthygut <- grepl(".*(healthy.*COVID|COVID.*healthy).*", gut_sigs$comparison1, ignore.case = TRUE)
+recovgut <- grepl("recovered*", gut_sigs$comparison1, ignore.case = TRUE)
+sickgut <- grepl(".*(patients.*patients|patients.*patients).*", gut_sigs$comparison1, ignore.case = TRUE)
+gut_sigs1 <- gut_sigs %>%
+      mutate(casecont = ifelse(healthygut, 1, 0)) %>%
+  mutate(recov = ifelse(recovgut, 1, 0)) %>%
+   mutate(sick2 = ifelse(sickgut, 1, 0))
+
+URT_sigs1 <- rbind(naso_sigs1, oro_sigs1)
+
+all_sigs1 <- rbind(naso_sigs1, oro_sigs1, gut_sigs1)
+```
+
+# Cluster analysis
+
+First calculate pairwise overlaps for all signatures of length > 1:
+## OVERALL CLUSTER ANALYSIS - all signatures
+```{r}
+allsigs <- bugsigdbr::getSignatures(all_sigs1, tax.id.type = "taxname")
+allsigs <- allsigs[sapply(allsigs, length) > 1] #require length > 1
+dim(allsigs)
+mydists_all <- BugSigDBStats::calcPairwiseOverlaps(allsigs)
+dim(mydists_all)
+View(allsigs)
+```
+
+```{r}
+allsignames <- unique(c(mydists_all$name1, mydists_all$name2))
+jmat_all <- matrix(NA, nrow=length(allsignames), ncol=length(allsignames), dimnames=list(allsignames, allsignames))
+diag(jmat_all) <- 1
+for (i in 1:nrow(mydists_all)){
+  jmat_all[mydists_all[i, "name2"], mydists_all[i, "name1"]] <- mydists_all[i, "jaccard"]
+  jmat_all[mydists_all[i, "name1"], mydists_all[i, "name2"]] <- mydists_all[i, "jaccard"]
+}
+View(jmat_all)
+```
+
+```{r, fig.height=60, fig.width=20, results = TRUE}
+hc_all <- hclust(as.dist(jmat_all))
+plot(hc_all)
+```
+
+```{r}
+library(dplyr)
+clustsall <- sort(cutree(hc_all, h = 0.05))
+lapply(unique(clustsall), function(i) names(clustsall)[clustsall == i])
+
+clustnames<- as.vector(names(clustsall))
+clustval <- as.vector(clustsall)
+cn <- data.frame(clustnames, clustval) %>%
+  mutate(ID = substr(clustnames, 1, 12))
+
+allclust <- merge(all_sigs1, cn, by = "ID") %>%
+  mutate_if(is.character, as.factor) %>%
+  mutate(as.factor(casecont)) %>%
+  mutate(as.factor(clustval))
+str(allclust)
+```
+
+```{r warning = FALSE, results = TRUE}
+match(c("Body site", "Location of subjects", "Sequencing type", "Sequencing platform", "casecont", "clustval", "recov",  "sick2"), names(allclust))
+
+chisqall <- lapply(allclust[,c(13,15,23,25,43,44,45)], function(x){ chisq.test(allclust[,49], x)}
+               )
+do.call(rbind,chisqall)[,c(1,3)]
+```
+
+###silhouette plot
+```{r}
+library(cluster)
+dev.new(width = 10, height = 5, unit = "in")
+plot(silhouette(cutree(hc_all, h = 0.05),jmat_all))
+```
+
+##gut cluster analysis
+```{r}
+library(dplyr)
+sigs.gut <- bugsigdbr::getSignatures(gut_sigs, tax.id.type = "taxname")
+sigs.gut <- sigs.gut[sapply(sigs.gut, length) > 1] #require length > 1
+dim(sigs.gut)
+mydists_gut <- BugSigDBStats::calcPairwiseOverlaps(sigs.gut)
+
+gut2 <- gut_sigs1 %>%
+  select("studyexp","Body site", "Location of subjects", "Sequencing type", "Sequencing platform", "comparison1", "ID", "casecont", "recov", "sick2") %>%
+  mutate(sigs = bugsigdbr::getSignatures(gut_sigs, tax.id.type = "taxname")) 
+
+sigs.gut2 <- gut2[sapply(gut2$sigs, length) > 1,] %>%
+  mutate(location = as.factor(`Location of subjects`)) %>%
+           mutate(seqtype = as.factor(`Sequencing type`)) %>%
+                    mutate(seqplat = as.factor(`Sequencing platform`)) %>%
+  select(-c("Location of subjects", "Body site", "Sequencing type","Sequencing platform"))
+```
+
+```{r}
+gutsignames <- unique(c(mydists_gut$name1, mydists_gut$name2))
+jmat_gut <- matrix(NA, nrow=length(gutsignames), ncol=length(gutsignames), dimnames=list(gutsignames, gutsignames))
+diag(jmat_gut) <- 1
+for (i in 1:nrow(mydists_gut)){
+  jmat_gut[mydists_gut[i, "name2"], mydists_gut[i, "name1"]] <- mydists_gut[i, "jaccard"]
+  jmat_gut[mydists_gut[i, "name1"], mydists_gut[i, "name2"]] <- mydists_gut[i, "jaccard"]
+}
+View(jmat_gut)
+```
+
+```{r, fig.height=60, fig.width=20, results = TRUE}
+hc_gut <- hclust(as.dist(jmat_gut))
+plot(hc_gut)
+```
+
+###silhouette plot
+```{r results = TRUE}
+library(cluster)
+dev.new(width = 10, height = 5, unit = "in")
+plot(silhouette(cutree(hc_gut, h = 0.05),jmat_gut))
+```
+
+```{r}
+clustsgut <- sort(cutree(hc_gut, h = 0.05))
+lapply(unique(clustsgut), function(i) names(clustsgut)[clustsgut == i])
+
+clustnames<- as.vector(names(clustsgut))
+clustval <- as.vector(clustsgut)
+cn <- data.frame(clustnames, clustval) %>%
+  mutate(ID = substr(clustnames, 1, 12))
+
+gutclust <- merge(gut2, cn, by = "ID") %>%
+  select(-c("sigs")) %>%
+  mutate_if(is.character, as.factor) %>%
+  mutate(as.factor(casecont)) %>%
+  mutate(as.factor(clustval))
+str(gutclust)
+```
+
+##are any of the following variables (seq type, seq platform, case/control vs not, etc) associated with cluster group?
+```{r, warning=FALSE}
+match(c("casecont", "Location of subjects", "Sequencing type", "Sequencing platform", "clustval", "recov",  "sick2"), names(gutclust))
+chisqgut <- lapply(gutclust[,c(4,5,6,8,9,10)], function(x){ chisq.test(gutclust[,12], x)} 
+                    )
+do.call(rbind,chisqgut)[,c(1,3)] 
+```
+
+
+##SEMANTIC SIMILARITY ANALYSIS
+```{r}
+library(ontologyIndex)
+onto <- ontologyIndex::get_ontology("http://purl.obolibrary.org/obo/ncbitaxon.obo")
+```
+
+```{r heinzcache, echo = FALSE} 
+onto <- BugSigDBStats:::.getResourceFromCache("ncbi.onto")
+if(is.null(onto))
+{
+    onto <- ontologyIndex::get_ontology("http://purl.obolibrary.org/obo/ncbitaxon.obo")
+    BugSigDBStats:::.cacheResource(onto, "ncbi.onto")
+} 
+```
+
+```{r}
+onto
+head(onto$id)
+```
+
+We add the corresponding ID prefix:
+
+```{r}
+sigs <- bugsigdbr::getSignatures(gut_sigs, tax.id.type = "ncbi")
+sigs <- lapply(sigs, function(s) paste0("NCBITaxon:", s))
+```            
+
+We remove taxa that are not in the NCBI Taxonomy:
+
+```{r}
+utax <- unique(unlist(sigs))
+nt <- utax[!(utax %in% onto$id)]
+sigs <- lapply(sigs, function(s) setdiff(s, nt))
+```
+
+Now, we compute pairwise semantic similarity for all signatures:
+
+```{r}
+library(ontologySimilarity)
+sim.mat <- ontologySimilarity::get_sim_grid(ontology = onto, term_sets = sigs)
+sim.mat[1:5,1:5]
+```
+
+Given the matrix of pairwise semantic similarity between signatures, we can also
+compute the semantic similarity of a group of signatures by eg. taking the average
+similarity between all pairs of signatures.
+
+Here, we compute the semantic similarity of all COVID-19 gut signatures in
+the database for which abundance is increased in the cases. 
+
+```{r}
+ind <- !is.na(gut_sigs[["Condition"]]) &
+       gut_sigs[["Condition"]] == "COVID-19" & 
+       gut_sigs[["Body site"]] == "feces" & 
+       gut_sigs[["Abundance in Group 1"]] == "increased"
+ontologySimilarity::get_sim(sim.mat, group = which(ind))
+```
+
+Furthermore, we can compute a p-value for assessing the statistical
+significance of the similiarity of a group of signatures. The p-value is calculated
+by random sampling of groups ofthe same size as ‘group’, and calculating how many
+random groups have at least as great group similarity than does ‘group’.
+
+```{r}
+ontologySimilarity::get_sim_p(sim.mat, group = which(ind))
+```
